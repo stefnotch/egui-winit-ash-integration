@@ -16,6 +16,7 @@ use cgmath::{Deg, Matrix4, Point3, Vector3};
 use crevice::std140::{AsStd140, Std140};
 use gpu_allocator::vulkan::*;
 use memoffset::offset_of;
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 #[cfg(debug_assertions)]
 use vk::DebugUtilsMessengerEXT;
 use winit::dpi::PhysicalSize;
@@ -233,10 +234,10 @@ impl App {
                 .engine_name(&engine_name);
 
             // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(&window)?;
+            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
             let mut extension_names = extension_names
                 .iter()
-                .map(|name| name.as_ptr())
+                .map(|name| *name)
                 .collect::<Vec<_>>();
             if ENABLE_VALIDATION_LAYERS {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -317,7 +318,7 @@ impl App {
 
         // Create Surface
         let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, &window, None)? };
+        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
 
         // Select Physical Device
         let (physical_device, graphics_queue_index, present_queue_index) = {

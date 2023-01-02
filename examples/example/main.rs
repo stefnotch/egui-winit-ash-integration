@@ -22,6 +22,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 #[cfg(debug_assertions)]
 const ENABLE_VALIDATION_LAYERS: bool = true;
@@ -222,10 +223,10 @@ impl App {
                 .engine_name(&engine_name);
 
             // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(&window)?;
+            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
             let mut extension_names = extension_names
                 .iter()
-                .map(|name| name.as_ptr())
+                .map(|name| *name)
                 .collect::<Vec<_>>();
             if ENABLE_VALIDATION_LAYERS {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -244,7 +245,7 @@ impl App {
             // instance create info
             let create_info = vk::InstanceCreateInfo::builder()
                 .application_info(&app_info)
-                .enabled_extension_names(&extension_names);
+                .enabled_extension_names(extension_names.as_slice());
             let create_info = if ENABLE_VALIDATION_LAYERS {
                 create_info.enabled_layer_names(&enabled_layer_names)
             } else {
@@ -306,7 +307,7 @@ impl App {
 
         // Create Surface
         let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, &window, None)? };
+        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
 
         // Select Physical Device
         let (physical_device, graphics_queue_index, present_queue_index) = {
