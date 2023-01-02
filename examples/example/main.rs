@@ -1726,7 +1726,7 @@ impl App {
         }
 
         // #### egui ##########################################################################
-        self.egui_integration.update_swapchain(
+        self.egui_integration.resize(
             self.width,
             self.height,
             self.swapchain.clone(),

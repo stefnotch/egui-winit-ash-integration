@@ -1946,7 +1946,7 @@ impl App {
             unsafe { self.swapchain_loader.get_swapchain_images(self.swapchain)? };
 
         // #### egui ##########################################################################
-        self.egui_integration.update_swapchain(
+        self.egui_integration.resize(
             self.width,
             self.height,
             self.swapchain.clone(),
