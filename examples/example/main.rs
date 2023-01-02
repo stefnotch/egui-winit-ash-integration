@@ -13,16 +13,15 @@ use ash::extensions::khr::{Surface, Swapchain};
 use ash::{vk, Device, Entry, Instance};
 use ash_window::{create_surface, enumerate_required_extensions};
 use cgmath::{Deg, Matrix4, Point3, Vector3};
-use crevice::std140::{AsStd140, Std140};
+use crevice::std140::AsStd140;
+use egui_winit::winit::dpi::PhysicalSize;
+use egui_winit::winit::event::{Event, WindowEvent};
+use egui_winit::winit::event_loop::{EventLoop, ControlFlow};
+use egui_winit::winit::window::{Window, WindowBuilder};
 use gpu_allocator::vulkan::*;
 use memoffset::offset_of;
 #[cfg(debug_assertions)]
 use vk::DebugUtilsMessengerEXT;
-use winit::dpi::PhysicalSize;
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{Window, WindowBuilder};
-use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 #[cfg(debug_assertions)]
 const ENABLE_VALIDATION_LAYERS: bool = true;
@@ -223,10 +222,10 @@ impl App {
                 .engine_name(&engine_name);
 
             // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
+            let extension_names = enumerate_required_extensions(&window)?;
             let mut extension_names = extension_names
                 .iter()
-                .map(|name| *name)
+                .map(|name| name.as_ptr())
                 .collect::<Vec<_>>();
             if ENABLE_VALIDATION_LAYERS {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -307,7 +306,7 @@ impl App {
 
         // Create Surface
         let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
+        let surface = unsafe { create_surface(&entry, &instance, &window, None)? };
 
         // Select Physical Device
         let (physical_device, graphics_queue_index, present_queue_index) = {
@@ -1108,6 +1107,7 @@ impl App {
         // create integration object
         // Note: ManuallyDrop is required to drop the allocator to shut it down successfully.
         let egui_integration = ManuallyDrop::new(egui_winit_ash_integration::Integration::new(
+            &window,
             width,
             height,
             window.scale_factor(),
@@ -1325,7 +1325,7 @@ impl App {
                     .set_visuals(egui::style::Visuals::light()),
             }
 
-            self.egui_integration.begin_frame();
+            self.egui_integration.begin_frame(&self.window);
             egui::SidePanel::left("my_side_panel").show(&self.egui_integration.context(), |ui| {
                 ui.heading("Hello");
                 ui.label("Hello egui!");
@@ -1813,16 +1813,24 @@ fn main() -> Result<()> {
     let mut app = App::new(&event_loop)?;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
-        app.egui_integration.handle_event(&event);
+        
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => app.recreate_swapchain().unwrap(),
+            Event::WindowEvent { event, window_id: _ } => {
+                // Update Egui integration so the UI works!
+                let _pass_events_to_game = !app.egui_integration.update(&event);
+                match event {
+                    WindowEvent::Resized(_) => {
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::CloseRequested => {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => (),
+                }
+            },
             Event::MainEventsCleared => app.window.request_redraw(),
             Event::RedrawRequested(_window_id) => app.draw().unwrap(),
             _ => (),

@@ -2,34 +2,21 @@
 
 use std::ffi::CString;
 use std::include_bytes;
-use std::time::Instant;
 
 use ash::{extensions::khr::Swapchain, vk, Device};
 use bytemuck::bytes_of;
-use copypasta::{ClipboardContext, ClipboardProvider};
-use egui::{
-    emath::{pos2, vec2},
-    epaint::ClippedShape,
-    CtxRef, Key,
-};
-use winit::event::{Event, ModifiersState, VirtualKeyCode, WindowEvent};
-use winit::window::Window;
+use egui::{epaint::ClippedShape, CtxRef};
+use egui_winit::winit::window::Window;
 
 use crate::*;
 
 /// egui integration with winit and ash.
 pub struct Integration<A: AllocatorTrait> {
-    start_time: Option<Instant>,
-
     physical_width: u32,
     physical_height: u32,
     scale_factor: f64,
     context: CtxRef,
-    raw_input: egui::RawInput,
-    mouse_pos: egui::Pos2,
-    modifiers_state: ModifiersState,
-    clipboard: ClipboardContext,
-    current_cursor_icon: egui::CursorIcon,
+    egui_winit: egui_winit::State,
 
     device: Device,
     allocator: A,
@@ -61,6 +48,7 @@ pub struct Integration<A: AllocatorTrait> {
 impl<A: AllocatorTrait> Integration<A> {
     /// Create an instance of the integration.
     pub fn new(
+        window: &Window,
         physical_width: u32,
         physical_height: u32,
         scale_factor: f64,
@@ -72,31 +60,11 @@ impl<A: AllocatorTrait> Integration<A> {
         swapchain: vk::SwapchainKHR,
         surface_format: vk::SurfaceFormatKHR,
     ) -> Self {
-        // Start time is initialized when first time call render_time
-        let start_time = None;
 
         // Create context
         let context = CtxRef::default();
         context.set_fonts(font_definitions);
         context.set_style(style);
-
-        // Create raw_input
-        let raw_input = egui::RawInput {
-            pixels_per_point: Some(scale_factor as f32),
-            screen_rect: Some(egui::Rect::from_min_size(
-                Default::default(),
-                vec2(physical_width as f32, physical_height as f32) / scale_factor as f32,
-            )),
-            time: Some(0.0),
-            ..Default::default()
-        };
-
-        // Create mouse pos and modifier state (These values are overwritten by handle events)
-        let mouse_pos = pos2(0.0, 0.0);
-        let modifiers_state = winit::event::ModifiersState::default();
-
-        // Create clipboard context
-        let clipboard = ClipboardContext::new().expect("Failed to initialize ClipboardContext.");
 
         // Get swap_images to get len of swapchain images and to create framebuffers
         let swap_images = unsafe {
@@ -506,19 +474,14 @@ impl<A: AllocatorTrait> Integration<A> {
         .expect("Failed to create descriptor set layout.");
         let user_textures = vec![];
 
-        Self {
-            start_time,
+        let egui_winit = egui_winit::State::new(window);
 
+        Self {
             physical_width,
             physical_height,
             scale_factor,
             context,
-            raw_input,
-            mouse_pos,
-            modifiers_state,
-            clipboard,
-            current_cursor_icon: egui::CursorIcon::None,
-
+            egui_winit,
             device,
             allocator,
             swapchain_loader,
@@ -559,274 +522,21 @@ impl<A: AllocatorTrait> Integration<A> {
     }
 
     /// handling winit event.
-    pub fn handle_event<T>(&mut self, winit_event: &Event<T>) {
-        match winit_event {
-            Event::WindowEvent {
-                window_id: _window_id,
-                event,
-            } => match event {
-                // window size changed
-                WindowEvent::Resized(physical_size) => {
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    self.raw_input.screen_rect = Some(egui::Rect::from_min_size(
-                        Default::default(),
-                        vec2(physical_size.width as f32, physical_size.height as f32)
-                            / pixels_per_point,
-                    ));
-                }
-                // dpi changed
-                WindowEvent::ScaleFactorChanged {
-                    scale_factor,
-                    new_inner_size,
-                } => {
-                    self.scale_factor = *scale_factor;
-                    self.raw_input.pixels_per_point = Some(*scale_factor as f32);
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    self.raw_input.screen_rect = Some(egui::Rect::from_min_size(
-                        Default::default(),
-                        vec2(new_inner_size.width as f32, new_inner_size.height as f32)
-                            / pixels_per_point,
-                    ));
-                }
-                // mouse click
-                WindowEvent::MouseInput { state, button, .. } => {
-                    if let Some(button) = Self::winit_to_egui_mouse_button(*button) {
-                        self.raw_input.events.push(egui::Event::PointerButton {
-                            pos: self.mouse_pos,
-                            button,
-                            pressed: *state == winit::event::ElementState::Pressed,
-                            modifiers: Self::winit_to_egui_modifiers(self.modifiers_state),
-                        });
-                    }
-                }
-                // mouse wheel
-                WindowEvent::MouseWheel { delta, .. } => match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        let line_height = 24.0;
-                        self.raw_input.events.push(egui::Event::Scroll(vec2(*x, *y) * line_height));
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
-                        self.raw_input.events.push(egui::Event::Scroll(vec2(delta.x as f32, delta.y as f32)));
-                    }
-                },
-                // mouse move
-                WindowEvent::CursorMoved { position, .. } => {
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    let pos = pos2(
-                        position.x as f32 / pixels_per_point,
-                        position.y as f32 / pixels_per_point,
-                    );
-                    self.raw_input.events.push(egui::Event::PointerMoved(pos));
-                    self.mouse_pos = pos;
-                }
-                // mouse out
-                WindowEvent::CursorLeft { .. } => {
-                    self.raw_input.events.push(egui::Event::PointerGone);
-                }
-                // modifier keys
-                WindowEvent::ModifiersChanged(input) => self.modifiers_state = *input,
-                // keyboard inputs
-                WindowEvent::KeyboardInput { input, .. } => {
-                    if let Some(virtual_keycode) = input.virtual_keycode {
-                        let pressed = input.state == winit::event::ElementState::Pressed;
-                        if pressed {
-                            let is_ctrl = self.modifiers_state.ctrl();
-                            if is_ctrl && virtual_keycode == VirtualKeyCode::C {
-                                self.raw_input.events.push(egui::Event::Copy);
-                            } else if is_ctrl && virtual_keycode == VirtualKeyCode::X {
-                                self.raw_input.events.push(egui::Event::Cut);
-                            } else if is_ctrl && virtual_keycode == VirtualKeyCode::V {
-                                if let Ok(contents) = self.clipboard.get_contents() {
-                                    self.raw_input.events.push(egui::Event::Text(contents));
-                                }
-                            } else if let Some(key) = Self::winit_to_egui_key_code(virtual_keycode)
-                            {
-                                self.raw_input.events.push(egui::Event::Key {
-                                    key,
-                                    pressed: input.state == winit::event::ElementState::Pressed,
-                                    modifiers: Self::winit_to_egui_modifiers(self.modifiers_state),
-                                })
-                            }
-                        }
-                    }
-                }
-                // receive character
-                WindowEvent::ReceivedCharacter(ch) => {
-                    // remove control character
-                    if ch.is_ascii_control() {
-                        return;
-                    }
-                    self.raw_input
-                        .events
-                        .push(egui::Event::Text(ch.to_string()));
-                }
-                _ => (),
-            },
-            _ => (),
-        }
-    }
-
-    fn winit_to_egui_key_code(key: VirtualKeyCode) -> Option<egui::Key> {
-        Some(match key {
-            VirtualKeyCode::Down => Key::ArrowDown,
-            VirtualKeyCode::Left => Key::ArrowLeft,
-            VirtualKeyCode::Right => Key::ArrowRight,
-            VirtualKeyCode::Up => Key::ArrowUp,
-            VirtualKeyCode::Escape => Key::Escape,
-            VirtualKeyCode::Tab => Key::Tab,
-            VirtualKeyCode::Back => Key::Backspace,
-            VirtualKeyCode::Return => Key::Enter,
-            VirtualKeyCode::Space => Key::Space,
-            VirtualKeyCode::Insert => Key::Insert,
-            VirtualKeyCode::Delete => Key::Delete,
-            VirtualKeyCode::Home => Key::Home,
-            VirtualKeyCode::End => Key::End,
-            VirtualKeyCode::PageUp => Key::PageUp,
-            VirtualKeyCode::PageDown => Key::PageDown,
-            VirtualKeyCode::Key0 => Key::Num0,
-            VirtualKeyCode::Key1 => Key::Num1,
-            VirtualKeyCode::Key2 => Key::Num2,
-            VirtualKeyCode::Key3 => Key::Num3,
-            VirtualKeyCode::Key4 => Key::Num4,
-            VirtualKeyCode::Key5 => Key::Num5,
-            VirtualKeyCode::Key6 => Key::Num6,
-            VirtualKeyCode::Key7 => Key::Num7,
-            VirtualKeyCode::Key8 => Key::Num8,
-            VirtualKeyCode::Key9 => Key::Num9,
-            VirtualKeyCode::A => Key::A,
-            VirtualKeyCode::B => Key::B,
-            VirtualKeyCode::C => Key::C,
-            VirtualKeyCode::D => Key::D,
-            VirtualKeyCode::E => Key::E,
-            VirtualKeyCode::F => Key::F,
-            VirtualKeyCode::G => Key::G,
-            VirtualKeyCode::H => Key::H,
-            VirtualKeyCode::I => Key::I,
-            VirtualKeyCode::J => Key::J,
-            VirtualKeyCode::K => Key::K,
-            VirtualKeyCode::L => Key::L,
-            VirtualKeyCode::M => Key::M,
-            VirtualKeyCode::N => Key::N,
-            VirtualKeyCode::O => Key::O,
-            VirtualKeyCode::P => Key::P,
-            VirtualKeyCode::Q => Key::Q,
-            VirtualKeyCode::R => Key::R,
-            VirtualKeyCode::S => Key::S,
-            VirtualKeyCode::T => Key::T,
-            VirtualKeyCode::U => Key::U,
-            VirtualKeyCode::V => Key::V,
-            VirtualKeyCode::W => Key::W,
-            VirtualKeyCode::X => Key::X,
-            VirtualKeyCode::Y => Key::Y,
-            VirtualKeyCode::Z => Key::Z,
-            _ => return None,
-        })
-    }
-
-    fn winit_to_egui_modifiers(modifiers: ModifiersState) -> egui::Modifiers {
-        egui::Modifiers {
-            alt: modifiers.alt(),
-            ctrl: modifiers.ctrl(),
-            shift: modifiers.shift(),
-            #[cfg(target_os = "macos")]
-            mac_cmd: modifiers.logo(),
-            #[cfg(target_os = "macos")]
-            command: modifiers.logo(),
-            #[cfg(not(target_os = "macos"))]
-            mac_cmd: false,
-            #[cfg(not(target_os = "macos"))]
-            command: modifiers.ctrl(),
-        }
-    }
-
-    fn winit_to_egui_mouse_button(
-        button: winit::event::MouseButton,
-    ) -> Option<egui::PointerButton> {
-        Some(match button {
-            winit::event::MouseButton::Left => egui::PointerButton::Primary,
-            winit::event::MouseButton::Right => egui::PointerButton::Secondary,
-            winit::event::MouseButton::Middle => egui::PointerButton::Middle,
-            _ => return None,
-        })
-    }
-
-    /// Convert from [`egui::CursorIcon`] to [`winit::window::CursorIcon`].
-    fn egui_to_winit_cursor_icon(
-        cursor_icon: egui::CursorIcon,
-    ) -> Option<winit::window::CursorIcon> {
-        Some(match cursor_icon {
-            egui::CursorIcon::Default => winit::window::CursorIcon::Default,
-            egui::CursorIcon::PointingHand => winit::window::CursorIcon::Hand,
-            egui::CursorIcon::ResizeHorizontal => winit::window::CursorIcon::ColResize,
-            egui::CursorIcon::ResizeNeSw => winit::window::CursorIcon::NeResize,
-            egui::CursorIcon::ResizeNwSe => winit::window::CursorIcon::NwResize,
-            egui::CursorIcon::ResizeVertical => winit::window::CursorIcon::RowResize,
-            egui::CursorIcon::Text => winit::window::CursorIcon::Text,
-            egui::CursorIcon::Grab => winit::window::CursorIcon::Grab,
-            egui::CursorIcon::Grabbing => winit::window::CursorIcon::Grabbing,
-            egui::CursorIcon::None => return None,
-            egui::CursorIcon::ContextMenu => winit::window::CursorIcon::ContextMenu,
-            egui::CursorIcon::Help => winit::window::CursorIcon::Help,
-            egui::CursorIcon::Progress => winit::window::CursorIcon::Progress,
-            egui::CursorIcon::Wait => winit::window::CursorIcon::Wait,
-            egui::CursorIcon::Cell => winit::window::CursorIcon::Cell,
-            egui::CursorIcon::Crosshair => winit::window::CursorIcon::Crosshair,
-            egui::CursorIcon::VerticalText => winit::window::CursorIcon::VerticalText,
-            egui::CursorIcon::Alias => winit::window::CursorIcon::Alias,
-            egui::CursorIcon::Copy => winit::window::CursorIcon::Copy,
-            egui::CursorIcon::Move => winit::window::CursorIcon::Move,
-            egui::CursorIcon::NoDrop => winit::window::CursorIcon::NoDrop,
-            egui::CursorIcon::NotAllowed => winit::window::CursorIcon::NotAllowed,
-            egui::CursorIcon::AllScroll => winit::window::CursorIcon::AllScroll,
-            egui::CursorIcon::ZoomIn => winit::window::CursorIcon::ZoomIn,
-            egui::CursorIcon::ZoomOut => winit::window::CursorIcon::ZoomOut,
-        })
+    pub fn update(&mut self, winit_event: &egui_winit::winit::event::WindowEvent<'_>) -> bool {
+        self.egui_winit.on_event(&self.context, winit_event)
     }
 
     /// begin frame.
-    pub fn begin_frame(&mut self) {
-        self.context.begin_frame(self.raw_input.take());
+    pub fn begin_frame(&mut self, window: &Window) {
+        let raw_input = self.egui_winit.take_egui_input(window);
+        self.context.begin_frame(raw_input);
     }
 
     /// end frame.
     pub fn end_frame(&mut self, window: &Window) -> (egui::Output, Vec<ClippedShape>) {
         let (output, clipped_shapes) = self.context.end_frame();
 
-        // handle links
-        if let Some(egui::output::OpenUrl { url, .. }) = &output.open_url {
-            if let Err(err) = webbrowser::open(url) {
-                eprintln!("Failed to open url: {}", err);
-            }
-        }
-
-        // handle clipboard
-        if !output.copied_text.is_empty() {
-            if let Err(err) = self.clipboard.set_contents(output.copied_text.clone()) {
-                eprintln!("Copy/Cut error: {}", err);
-            }
-        }
-
-        // handle cursor icon
-        if self.current_cursor_icon != output.cursor_icon {
-            if let Some(cursor_icon) =
-                Integration::<A>::egui_to_winit_cursor_icon(output.cursor_icon)
-            {
-                window.set_cursor_visible(true);
-                window.set_cursor_icon(cursor_icon);
-            } else {
-                window.set_cursor_visible(false);
-            }
-            self.current_cursor_icon = output.cursor_icon;
-        }
+        self.egui_winit.handle_output(window, &self.context, output.clone());
 
         (output, clipped_shapes)
     }
@@ -844,13 +554,6 @@ impl<A: AllocatorTrait> Integration<A> {
         clipped_meshes: Vec<egui::ClippedMesh>,
     ) {
         let index = swapchain_image_index;
-
-        // update time
-        if let Some(time) = self.start_time {
-            self.raw_input.time = Some(time.elapsed().as_secs_f64());
-        } else {
-            self.start_time = Some(Instant::now());
-        }
 
         // update font texture
         self.upload_font_texture(command_buffer, &self.context.fonts().font_image());
