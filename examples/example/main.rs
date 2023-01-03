@@ -6,6 +6,7 @@ use std::os::raw::c_void;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashSet, u64};
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 use anyhow::Result;
 use ash::extensions::ext::DebugUtils;
@@ -188,7 +189,7 @@ struct App {
     render_finished_semaphores: Vec<vk::Semaphore>,
     command_buffers: Vec<vk::CommandBuffer>,
 
-    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration<Arc<Mutex<Allocator>>>>,
+    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration>,
     theme: EguiTheme,
     rotation: f32,
     light_position: Vector3<f32>,
@@ -222,10 +223,10 @@ impl App {
                 .engine_name(&engine_name);
 
             // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(&window)?;
+            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
             let mut extension_names = extension_names
                 .iter()
-                .map(|name| name.as_ptr())
+                .map(|name| *name)
                 .collect::<Vec<_>>();
             if ENABLE_VALIDATION_LAYERS {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -306,7 +307,7 @@ impl App {
 
         // Create Surface
         let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, &window, None)? };
+        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
 
         // Select Physical Device
         let (physical_device, graphics_queue_index, present_queue_index) = {
@@ -1107,13 +1108,15 @@ impl App {
         // create integration object
         // Note: ManuallyDrop is required to drop the allocator to shut it down successfully.
         let egui_integration = ManuallyDrop::new(egui_winit_ash_integration::Integration::new(
-            &window,
+            event_loop,
             width,
             height,
             window.scale_factor(),
             egui::FontDefinitions::default(),
             egui::Style::default(),
             device.clone(),
+            graphics_queue_index,
+            graphics_queue,
             Arc::clone(&allocator),
             swapchain_loader.clone(),
             swapchain.clone(),
@@ -1399,10 +1402,10 @@ impl App {
                     ui.separator();
                     ui.text_edit_singleline(&mut self.text);
                 });
-            let (_, shapes) = self.egui_integration.end_frame(&mut self.window);
-            let clipped_meshes = self.egui_integration.context().tessellate(shapes);
+            let output = self.egui_integration.end_frame(&mut self.window);
+            let clipped_meshes = self.egui_integration.context().tessellate(output.shapes);
             self.egui_integration
-                .paint(command_buffer, image_index, clipped_meshes);
+                .paint(command_buffer, image_index, clipped_meshes, output.textures_delta);
             // #### egui ##########################################################################
 
             self.device.end_command_buffer(command_buffer)?;
@@ -1817,7 +1820,8 @@ fn main() -> Result<()> {
         match event {
             Event::WindowEvent { event, window_id: _ } => {
                 // Update Egui integration so the UI works!
-                let _pass_events_to_game = !app.egui_integration.update(&event);
+                let _response = app.egui_integration.update(&event);
+
                 match event {
                     WindowEvent::Resized(_) => {
                         app.recreate_swapchain().unwrap();
