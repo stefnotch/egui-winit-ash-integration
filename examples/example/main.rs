@@ -189,7 +189,7 @@ struct App {
     render_finished_semaphores: Vec<vk::Semaphore>,
     command_buffers: Vec<vk::CommandBuffer>,
 
-    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration>,
+    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration<Arc<Mutex<Allocator>>>>,
     theme: EguiTheme,
     rotation: f32,
     light_position: Vector3<f32>,

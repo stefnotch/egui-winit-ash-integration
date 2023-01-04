@@ -190,7 +190,7 @@ struct App {
     render_finished_semaphores: Vec<vk::Semaphore>,
     command_buffers: Vec<vk::CommandBuffer>,
 
-    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration>,
+    egui_integration: ManuallyDrop<egui_winit_ash_integration::Integration<Arc<Mutex<Allocator>>>>,
     show_user_texture_window: bool,
     show_scene_window: bool,
     prev_pointer_pos: Option<egui::Pos2>,

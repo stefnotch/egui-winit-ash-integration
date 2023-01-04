@@ -14,20 +14,13 @@ use egui_winit::{
     winit::window::Window,
     EventResponse
 };
-use ::gpu_allocator::vulkan::{Allocator, Allocation, AllocationCreateDesc};
 use winit::event_loop::EventLoop;
-use gpu_allocator::MemoryLocation;
-use std::{
-    sync::{
-        Mutex, Arc
-    },
-    ffi::CString
-};
+use std::ffi::CString;
 
-use crate::utils::insert_image_memory_barrier;
+use crate::{*, utils::insert_image_memory_barrier};
 
 /// egui integration with winit and ash.
-pub struct Integration {
+pub struct Integration<A: AllocatorTrait> {
     physical_width: u32,
     physical_height: u32,
     scale_factor: f64,
@@ -35,7 +28,7 @@ pub struct Integration {
     egui_winit: egui_winit::State,
 
     device: Device,
-    allocator: Arc<Mutex<Allocator>>,
+    allocator: A,
     qfi: u32,
     queue: vk::Queue,
     swapchain_loader: Swapchain,
@@ -48,19 +41,19 @@ pub struct Integration {
     framebuffer_color_image_views: Vec<vk::ImageView>,
     framebuffers: Vec<vk::Framebuffer>,
     vertex_buffers: Vec<vk::Buffer>,
-    vertex_buffer_allocations: Vec<Allocation>,
+    vertex_buffer_allocations: Vec<A::Allocation>,
     index_buffers: Vec<vk::Buffer>,
-    index_buffer_allocations: Vec<Allocation>,
+    index_buffer_allocations: Vec<A::Allocation>,
     texture_desc_sets: AHashMap<TextureId, vk::DescriptorSet>,
     texture_images: AHashMap<TextureId, vk::Image>,
     texture_image_infos: AHashMap<TextureId, vk::ImageCreateInfo>,
-    texture_allocations: AHashMap<TextureId, Allocation>,
+    texture_allocations: AHashMap<TextureId, A::Allocation>,
     texture_image_views: AHashMap<TextureId, vk::ImageView>,
     
     user_texture_layout: vk::DescriptorSetLayout,
     user_textures: Vec<Option<vk::DescriptorSet>>,
 }
-impl Integration {
+impl<A: AllocatorTrait> Integration<A> {
     /// Create an instance of the integration.
     pub fn new<T>(
         event_loop: &EventLoop<T>,
@@ -70,7 +63,7 @@ impl Integration {
         font_definitions: egui::FontDefinitions,
         style: egui::Style,
         device: Device,
-        allocator: Arc<Mutex<Allocator>>,
+        allocator: A,
         qfi: u32,
         queue: vk::Queue,
         swapchain_loader: Swapchain,
@@ -406,13 +399,11 @@ impl Integration {
             let vertex_buffer_requirements =
                 unsafe { device.get_buffer_memory_requirements(vertex_buffer) };
             let vertex_buffer_allocation = allocator
-                .lock().unwrap()
-                .allocate(&AllocationCreateDesc {
-                    name: "",
-                    requirements: vertex_buffer_requirements,
-                    location: MemoryLocation::CpuToGpu,
-                    linear: true,
-                })
+                .allocate(A::AllocationCreateInfo::new(
+                    vertex_buffer_requirements,
+                    MemoryLocation::CpuToGpu,
+                    true,
+                ))
                 .expect("Failed to create vertex buffer.");
             unsafe {
                 device
@@ -438,13 +429,11 @@ impl Integration {
             let index_buffer_requirements =
                 unsafe { device.get_buffer_memory_requirements(index_buffer) };
             let index_buffer_allocation = allocator
-                .lock().unwrap()
-                .allocate(&AllocationCreateDesc {
-                    name: "",
-                    requirements: index_buffer_requirements,
-                    location: MemoryLocation::CpuToGpu,
-                    linear: true,
-                })
+                .allocate(A::AllocationCreateInfo::new(
+                    index_buffer_requirements,
+                    MemoryLocation::CpuToGpu,
+                    true,
+                ))
                 .expect("Failed to create index buffer.");
             unsafe {
                 device
@@ -805,7 +794,7 @@ impl Integration {
                 }
             }
             if let Some((_, allocation)) = self.texture_allocations.remove_entry(&id) {
-                self.allocator.lock().unwrap().free(allocation).unwrap();
+                self.allocator.free(allocation).unwrap();
             }
         }
     }
@@ -854,12 +843,11 @@ impl Integration {
                 .usage(vk::BufferUsageFlags::TRANSFER_SRC);
             let texture_buffer = unsafe { self.device.create_buffer(&buffer_info, None) }.unwrap();
             let requirements = unsafe { self.device.get_buffer_memory_requirements(texture_buffer) };
-            let allocation = self.allocator.lock().unwrap().allocate(&AllocationCreateDesc {
-                name: "staging terrain vertex buffer",
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
                 requirements,
-                location: gpu_allocator::MemoryLocation::CpuToGpu,
-                linear: true,
-            }).unwrap();
+                MemoryLocation::CpuToGpu,
+                true
+            )).unwrap();
             unsafe { self.device.bind_buffer_memory(texture_buffer, allocation.memory(), allocation.offset()).unwrap() };
             (texture_buffer, allocation)
         };
@@ -888,12 +876,11 @@ impl Integration {
                 .build();
             let handle = unsafe { self.device.create_image(&create_info, None) }.unwrap();
             let requirements = unsafe { self.device.get_image_memory_requirements(handle) };
-            let allocation = self.allocator.lock().unwrap().allocate(&AllocationCreateDesc {
-                name: "",
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
                 requirements,
-                location: gpu_allocator::MemoryLocation::GpuOnly,
-                linear: false,
-            }).unwrap();
+                MemoryLocation::GpuOnly,
+                false
+            )).unwrap();
             unsafe { self.device.bind_image_memory(handle, allocation.memory(), allocation.offset()).unwrap() };
             (handle, create_info, allocation)
         };
@@ -1079,7 +1066,7 @@ impl Integration {
                     // destroy texture_image and view
                     self.device.destroy_image(texture_image, None);
                     self.device.destroy_image_view(texture_image_view, None);
-                    self.allocator.lock().unwrap().free(texture_allocation).unwrap();
+                    self.allocator.free(texture_allocation).unwrap();
                 }
             } else {
                 return;
@@ -1122,7 +1109,7 @@ impl Integration {
         // cleanup
         unsafe {
             self.device.destroy_buffer(staging_buffer, None);
-            self.allocator.lock().unwrap().free(staging_allocation).unwrap();
+            self.allocator.free(staging_allocation).unwrap();
             self.device.destroy_command_pool(cmd_pool, None);
             self.device.destroy_fence(cmd_buff_fence, None);
         }
@@ -1485,7 +1472,6 @@ impl Integration {
         {
             self.device.destroy_buffer(buffer, None);
             self.allocator
-                .lock().unwrap()
                 .free(allocation)
                 .expect("Failed to free allocation");
         }
@@ -1496,7 +1482,6 @@ impl Integration {
         {
             self.device.destroy_buffer(buffer, None);
             self.allocator
-                .lock().unwrap()
                 .free(allocation)
                 .expect("Failed to free allocation");
         }
@@ -1525,7 +1510,7 @@ impl Integration {
             self.device.destroy_image_view(texture_image_view, None);
         }
         for (_texture_id, texture_allocation) in self.texture_allocations.drain() {
-            self.allocator.lock().unwrap().free(texture_allocation).unwrap();
+            self.allocator.free(texture_allocation).unwrap();
         }
     }
 }
