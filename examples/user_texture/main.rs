@@ -2063,7 +2063,7 @@ fn main() -> Result<()> {
         match event {
             Event::WindowEvent { event, window_id: _ } => {
                 // Update Egui integration so the UI works!
-                let _response = app.egui_integration.update(&event);
+                let _response = app.egui_integration.handle_event(&event);
                 match event {
                     WindowEvent::Resized(_) => {
                         app.recreate_swapchain().unwrap();

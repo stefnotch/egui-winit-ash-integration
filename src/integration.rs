@@ -514,7 +514,7 @@ impl<A: AllocatorTrait> Integration<A> {
     }
 
     /// handling winit event.
-    pub fn update(&mut self, winit_event: &egui_winit::winit::event::WindowEvent<'_>) -> EventResponse {
+    pub fn handle_event(&mut self, winit_event: &egui_winit::winit::event::WindowEvent<'_>) -> EventResponse {
         self.egui_winit.on_event(&self.context, winit_event)
     }
 
