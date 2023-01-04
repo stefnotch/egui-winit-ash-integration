@@ -55,7 +55,6 @@
 
 mod allocator;
 mod integration;
-mod renderer;
 mod utils;
 
 pub use allocator::*;

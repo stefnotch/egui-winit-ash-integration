@@ -1404,9 +1404,9 @@ impl App {
             egui::FontDefinitions::default(),
             egui::Style::default(),
             device.clone(),
+            Arc::clone(&allocator),
             graphics_queue_index,
             graphics_queue,
-            Arc::clone(&allocator),
             swapchain_loader.clone(),
             swapchain.clone(),
             format.clone(),
@@ -1950,7 +1950,7 @@ impl App {
             unsafe { self.swapchain_loader.get_swapchain_images(self.swapchain)? };
 
         // #### egui ##########################################################################
-        self.egui_integration.resize(
+        self.egui_integration.update_swapchain(
             self.width,
             self.height,
             self.swapchain.clone(),
