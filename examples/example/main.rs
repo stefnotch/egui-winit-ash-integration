@@ -6,6 +6,7 @@ use std::os::raw::c_void;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::{collections::HashSet, u64};
+use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 
 use anyhow::Result;
 use ash::extensions::ext::DebugUtils;
@@ -13,15 +14,15 @@ use ash::extensions::khr::{Surface, Swapchain};
 use ash::{vk, Device, Entry, Instance};
 use ash_window::{create_surface, enumerate_required_extensions};
 use cgmath::{Deg, Matrix4, Point3, Vector3};
-use crevice::std140::{AsStd140, Std140};
+use crevice::std140::AsStd140;
+use egui_winit::winit::dpi::PhysicalSize;
+use egui_winit::winit::event::{Event, WindowEvent};
+use egui_winit::winit::event_loop::{EventLoop, ControlFlow};
+use egui_winit::winit::window::{Window, WindowBuilder};
 use gpu_allocator::vulkan::*;
 use memoffset::offset_of;
 #[cfg(debug_assertions)]
 use vk::DebugUtilsMessengerEXT;
-use winit::dpi::PhysicalSize;
-use winit::event::{Event, WindowEvent};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::{Window, WindowBuilder};
 
 #[cfg(debug_assertions)]
 const ENABLE_VALIDATION_LAYERS: bool = true;
@@ -222,10 +223,10 @@ impl App {
                 .engine_name(&engine_name);
 
             // Get extensions for creating Surface
-            let extension_names = enumerate_required_extensions(&window)?;
+            let extension_names = enumerate_required_extensions(window.raw_display_handle())?;
             let mut extension_names = extension_names
                 .iter()
-                .map(|name| name.as_ptr())
+                .map(|name| *name)
                 .collect::<Vec<_>>();
             if ENABLE_VALIDATION_LAYERS {
                 extension_names.push(DebugUtils::name().as_ptr());
@@ -244,7 +245,7 @@ impl App {
             // instance create info
             let create_info = vk::InstanceCreateInfo::builder()
                 .application_info(&app_info)
-                .enabled_extension_names(&extension_names);
+                .enabled_extension_names(extension_names.as_slice());
             let create_info = if ENABLE_VALIDATION_LAYERS {
                 create_info.enabled_layer_names(&enabled_layer_names)
             } else {
@@ -306,7 +307,7 @@ impl App {
 
         // Create Surface
         let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe { create_surface(&entry, &instance, &window, None)? };
+        let surface = unsafe { create_surface(&entry, &instance, window.raw_display_handle(), window.raw_window_handle(), None)? };
 
         // Select Physical Device
         let (physical_device, graphics_queue_index, present_queue_index) = {
@@ -1107,6 +1108,7 @@ impl App {
         // create integration object
         // Note: ManuallyDrop is required to drop the allocator to shut it down successfully.
         let egui_integration = ManuallyDrop::new(egui_winit_ash_integration::Integration::new(
+            event_loop,
             width,
             height,
             window.scale_factor(),
@@ -1114,6 +1116,8 @@ impl App {
             egui::Style::default(),
             device.clone(),
             Arc::clone(&allocator),
+            graphics_queue_index,
+            graphics_queue,
             swapchain_loader.clone(),
             swapchain.clone(),
             format.clone(),
@@ -1324,7 +1328,7 @@ impl App {
                     .set_visuals(egui::style::Visuals::light()),
             }
 
-            self.egui_integration.begin_frame();
+            self.egui_integration.begin_frame(&self.window);
             egui::SidePanel::left("my_side_panel").show(&self.egui_integration.context(), |ui| {
                 ui.heading("Hello");
                 ui.label("Hello egui!");
@@ -1398,10 +1402,10 @@ impl App {
                     ui.separator();
                     ui.text_edit_singleline(&mut self.text);
                 });
-            let (_, shapes) = self.egui_integration.end_frame(&mut self.window);
-            let clipped_meshes = self.egui_integration.context().tessellate(shapes);
+            let output = self.egui_integration.end_frame(&mut self.window);
+            let clipped_meshes = self.egui_integration.context().tessellate(output.shapes);
             self.egui_integration
-                .paint(command_buffer, image_index, clipped_meshes);
+                .paint(command_buffer, image_index, clipped_meshes, output.textures_delta);
             // #### egui ##########################################################################
 
             self.device.end_command_buffer(command_buffer)?;
@@ -1812,16 +1816,25 @@ fn main() -> Result<()> {
     let mut app = App::new(&event_loop)?;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
-        app.egui_integration.handle_event(&event);
+        
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => app.recreate_swapchain().unwrap(),
+            Event::WindowEvent { event, window_id: _ } => {
+                // Update Egui integration so the UI works!
+                let _response = app.egui_integration.handle_event(&event);
+
+                match event {
+                    WindowEvent::Resized(_) => {
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::CloseRequested => {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => (),
+                }
+            },
             Event::MainEventsCleared => app.window.request_redraw(),
             Event::RedrawRequested(_window_id) => app.draw().unwrap(),
             _ => (),

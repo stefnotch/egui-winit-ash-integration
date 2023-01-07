@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/egui-winit-ash-integration/badge.svg)](https://docs.rs/egui-winit-ash-integration)
 ![MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Apache](https://img.shields.io/badge/license-Apache-blue.svg)
-[![egui version: 0.14.2](https://img.shields.io/badge/egui%20version-0.14.2-orange)](https://docs.rs/egui/0.14.2/egui/index.html)
+[![egui version: 0.20.1](https://img.shields.io/badge/egui%20version-0.20.1-orange)](https://docs.rs/egui/0.20.1/egui/index.html)
 
-This is the [egui](https://github.com/emilk/egui) integration crate for [winit](https://github.com/rust-windowing/winit) and [ash](https://github.com/MaikKlein/ash).
+This is the [egui](https://github.com/emilk/egui) integration crate for [egui-winit](https://github.com/emilk/egui/tree/master/crates/egui-winit) and [ash](https://github.com/MaikKlein/ash).
 The default GPU allocator is [gpu_allocator](https://github.com/Traverse-Research/gpu-allocator), but you can also implement AllocatorTrait.
 
 # Example
@@ -29,27 +29,32 @@ fn main() -> Result<()> {
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
-        // (2) Call integration.handle_event(&event).
-        app.egui_integration.handle_event(&event);
+        
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => *control_flow = ControlFlow::Exit,
-            Event::WindowEvent {
-                event: WindowEvent::Resized(_),
-                ..
-            } => {
-                // (3) Call integration.recreate_swapchain(...) in app.recreate_swapchain().
-                app.recreate_swapchain().unwrap();
-            }
+            Event::WindowEvent { event, window_id: _ } => {
+                // (2) Call integration.handle_event(&event).
+                let _response = app.egui_integration.handle_event(&event);
+                match event {
+                    WindowEvent::Resized(_) => {
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::ScaleFactorChanged { .. } => {
+                        // (3) Call integration.recreate_swapchain(...) in app.recreate_swapchain().
+                        app.recreate_swapchain().unwrap();
+                    }
+                    WindowEvent::CloseRequested => {
+                        *control_flow = ControlFlow::Exit;
+                    }
+                    _ => (),
+                }
+            },
             Event::MainEventsCleared => app.window.request_redraw(),
             Event::RedrawRequested(_window_id) => {
                 // (4) Call integration.begin_frame(), integration.end_frame(&mut window),
                 // integration.context().tessellate(shapes), integration.paint(...)
                 // in app.draw().
                 app.draw().unwrap();
-            }
+            },
             _ => (),
         }
     })

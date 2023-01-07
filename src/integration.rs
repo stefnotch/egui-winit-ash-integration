@@ -1,38 +1,36 @@
 #![warn(missing_docs)]
 
-use std::ffi::CString;
-use std::include_bytes;
-use std::time::Instant;
-
 use ash::{extensions::khr::Swapchain, vk, Device};
 use bytemuck::bytes_of;
-use copypasta::{ClipboardContext, ClipboardProvider};
 use egui::{
-    emath::{pos2, vec2},
-    epaint::ClippedShape,
-    CtxRef, Key,
+    epaint::{
+        ahash::AHashMap, ImageDelta
+    },
+    Context,
+    TexturesDelta,
+    TextureId
 };
-use winit::event::{Event, ModifiersState, VirtualKeyCode, WindowEvent};
-use winit::window::Window;
+use egui_winit::{
+    winit::window::Window,
+    EventResponse
+};
+use winit::event_loop::EventLoop;
+use std::ffi::CString;
 
-use crate::*;
+use crate::{*, utils::insert_image_memory_barrier};
 
 /// egui integration with winit and ash.
 pub struct Integration<A: AllocatorTrait> {
-    start_time: Option<Instant>,
-
     physical_width: u32,
     physical_height: u32,
     scale_factor: f64,
-    context: CtxRef,
-    raw_input: egui::RawInput,
-    mouse_pos: egui::Pos2,
-    modifiers_state: ModifiersState,
-    clipboard: ClipboardContext,
-    current_cursor_icon: egui::CursorIcon,
+    context: Context,
+    egui_winit: egui_winit::State,
 
     device: Device,
     allocator: A,
+    qfi: u32,
+    queue: vk::Queue,
     swapchain_loader: Swapchain,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
@@ -46,21 +44,19 @@ pub struct Integration<A: AllocatorTrait> {
     vertex_buffer_allocations: Vec<A::Allocation>,
     index_buffers: Vec<vk::Buffer>,
     index_buffer_allocations: Vec<A::Allocation>,
-    font_image_staging_buffer: vk::Buffer,
-    font_image_staging_buffer_allocation: Option<A::Allocation>,
-    font_image: vk::Image,
-    font_image_allocation: Option<A::Allocation>,
-    font_image_view: vk::ImageView,
-    font_image_size: (u64, u64),
-    font_image_version: u64,
-    font_descriptor_sets: Vec<vk::DescriptorSet>,
-
+    texture_desc_sets: AHashMap<TextureId, vk::DescriptorSet>,
+    texture_images: AHashMap<TextureId, vk::Image>,
+    texture_image_infos: AHashMap<TextureId, vk::ImageCreateInfo>,
+    texture_allocations: AHashMap<TextureId, A::Allocation>,
+    texture_image_views: AHashMap<TextureId, vk::ImageView>,
+    
     user_texture_layout: vk::DescriptorSetLayout,
     user_textures: Vec<Option<vk::DescriptorSet>>,
 }
 impl<A: AllocatorTrait> Integration<A> {
     /// Create an instance of the integration.
-    pub fn new(
+    pub fn new<T>(
+        event_loop: &EventLoop<T>,
         physical_width: u32,
         physical_height: u32,
         scale_factor: f64,
@@ -68,35 +64,19 @@ impl<A: AllocatorTrait> Integration<A> {
         style: egui::Style,
         device: Device,
         allocator: A,
+        qfi: u32,
+        queue: vk::Queue,
         swapchain_loader: Swapchain,
         swapchain: vk::SwapchainKHR,
         surface_format: vk::SurfaceFormatKHR,
     ) -> Self {
-        // Start time is initialized when first time call render_time
-        let start_time = None;
 
         // Create context
-        let context = CtxRef::default();
+        let context = Context::default();
         context.set_fonts(font_definitions);
         context.set_style(style);
 
-        // Create raw_input
-        let raw_input = egui::RawInput {
-            pixels_per_point: Some(scale_factor as f32),
-            screen_rect: Some(egui::Rect::from_min_size(
-                Default::default(),
-                vec2(physical_width as f32, physical_height as f32) / scale_factor as f32,
-            )),
-            time: Some(0.0),
-            ..Default::default()
-        };
-
-        // Create mouse pos and modifier state (These values are overwritten by handle events)
-        let mouse_pos = pos2(0.0, 0.0);
-        let modifiers_state = winit::event::ModifiersState::default();
-
-        // Create clipboard context
-        let clipboard = ClipboardContext::new().expect("Failed to initialize ClipboardContext.");
+        let egui_winit = egui_winit::State::new(&event_loop);
 
         // Get swap_images to get len of swapchain images and to create framebuffers
         let swap_images = unsafe {
@@ -471,24 +451,6 @@ impl<A: AllocatorTrait> Integration<A> {
             index_buffer_allocations.push(index_buffer_allocation);
         }
 
-        // Create font image and anything related to it
-        // These values will be uploaded at rendering time
-        let font_image_staging_buffer = Default::default();
-        let font_image_staging_buffer_allocation = None;
-        let font_image = Default::default();
-        let font_image_allocation = None;
-        let font_image_view = Default::default();
-        let font_image_size = (0, 0);
-        let font_image_version = 0;
-        let font_descriptor_sets = unsafe {
-            device.allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::builder()
-                    .descriptor_pool(descriptor_pool)
-                    .set_layouts(&descriptor_set_layouts),
-            )
-        }
-        .expect("Failed to create descriptor sets.");
-
         // User Textures
         let user_texture_layout = unsafe {
             device.create_descriptor_set_layout(
@@ -507,20 +469,16 @@ impl<A: AllocatorTrait> Integration<A> {
         let user_textures = vec![];
 
         Self {
-            start_time,
-
             physical_width,
             physical_height,
             scale_factor,
             context,
-            raw_input,
-            mouse_pos,
-            modifiers_state,
-            clipboard,
-            current_cursor_icon: egui::CursorIcon::None,
-
+            egui_winit,
+            
             device,
             allocator,
+            qfi,
+            queue,
             swapchain_loader,
             descriptor_pool,
             descriptor_set_layouts,
@@ -534,17 +492,14 @@ impl<A: AllocatorTrait> Integration<A> {
             vertex_buffer_allocations,
             index_buffers,
             index_buffer_allocations,
-            font_image_staging_buffer,
-            font_image_staging_buffer_allocation,
-            font_image,
-            font_image_allocation,
-            font_image_view,
-            font_image_size,
-            font_image_version,
-            font_descriptor_sets,
+            texture_desc_sets: AHashMap::new(),
+            texture_images: AHashMap::new(),
+            texture_image_infos: AHashMap::new(),
+            texture_allocations: AHashMap::new(),
+            texture_image_views: AHashMap::new(),
 
             user_texture_layout,
-            user_textures,
+            user_textures 
         }
     }
 
@@ -559,280 +514,29 @@ impl<A: AllocatorTrait> Integration<A> {
     }
 
     /// handling winit event.
-    pub fn handle_event<T>(&mut self, winit_event: &Event<T>) {
-        match winit_event {
-            Event::WindowEvent {
-                window_id: _window_id,
-                event,
-            } => match event {
-                // window size changed
-                WindowEvent::Resized(physical_size) => {
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    self.raw_input.screen_rect = Some(egui::Rect::from_min_size(
-                        Default::default(),
-                        vec2(physical_size.width as f32, physical_size.height as f32)
-                            / pixels_per_point,
-                    ));
-                }
-                // dpi changed
-                WindowEvent::ScaleFactorChanged {
-                    scale_factor,
-                    new_inner_size,
-                } => {
-                    self.scale_factor = *scale_factor;
-                    self.raw_input.pixels_per_point = Some(*scale_factor as f32);
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    self.raw_input.screen_rect = Some(egui::Rect::from_min_size(
-                        Default::default(),
-                        vec2(new_inner_size.width as f32, new_inner_size.height as f32)
-                            / pixels_per_point,
-                    ));
-                }
-                // mouse click
-                WindowEvent::MouseInput { state, button, .. } => {
-                    if let Some(button) = Self::winit_to_egui_mouse_button(*button) {
-                        self.raw_input.events.push(egui::Event::PointerButton {
-                            pos: self.mouse_pos,
-                            button,
-                            pressed: *state == winit::event::ElementState::Pressed,
-                            modifiers: Self::winit_to_egui_modifiers(self.modifiers_state),
-                        });
-                    }
-                }
-                // mouse wheel
-                WindowEvent::MouseWheel { delta, .. } => match delta {
-                    winit::event::MouseScrollDelta::LineDelta(x, y) => {
-                        let line_height = 24.0;
-                        self.raw_input.events.push(egui::Event::Scroll(vec2(*x, *y) * line_height));
-                    }
-                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
-                        self.raw_input.events.push(egui::Event::Scroll(vec2(delta.x as f32, delta.y as f32)));
-                    }
-                },
-                // mouse move
-                WindowEvent::CursorMoved { position, .. } => {
-                    let pixels_per_point = self
-                        .raw_input
-                        .pixels_per_point
-                        .unwrap_or_else(|| self.context.pixels_per_point());
-                    let pos = pos2(
-                        position.x as f32 / pixels_per_point,
-                        position.y as f32 / pixels_per_point,
-                    );
-                    self.raw_input.events.push(egui::Event::PointerMoved(pos));
-                    self.mouse_pos = pos;
-                }
-                // mouse out
-                WindowEvent::CursorLeft { .. } => {
-                    self.raw_input.events.push(egui::Event::PointerGone);
-                }
-                // modifier keys
-                WindowEvent::ModifiersChanged(input) => self.modifiers_state = *input,
-                // keyboard inputs
-                WindowEvent::KeyboardInput { input, .. } => {
-                    if let Some(virtual_keycode) = input.virtual_keycode {
-                        let pressed = input.state == winit::event::ElementState::Pressed;
-                        if pressed {
-                            let is_ctrl = self.modifiers_state.ctrl();
-                            if is_ctrl && virtual_keycode == VirtualKeyCode::C {
-                                self.raw_input.events.push(egui::Event::Copy);
-                            } else if is_ctrl && virtual_keycode == VirtualKeyCode::X {
-                                self.raw_input.events.push(egui::Event::Cut);
-                            } else if is_ctrl && virtual_keycode == VirtualKeyCode::V {
-                                if let Ok(contents) = self.clipboard.get_contents() {
-                                    self.raw_input.events.push(egui::Event::Text(contents));
-                                }
-                            } else if let Some(key) = Self::winit_to_egui_key_code(virtual_keycode)
-                            {
-                                self.raw_input.events.push(egui::Event::Key {
-                                    key,
-                                    pressed: input.state == winit::event::ElementState::Pressed,
-                                    modifiers: Self::winit_to_egui_modifiers(self.modifiers_state),
-                                })
-                            }
-                        }
-                    }
-                }
-                // receive character
-                WindowEvent::ReceivedCharacter(ch) => {
-                    // remove control character
-                    if ch.is_ascii_control() {
-                        return;
-                    }
-                    self.raw_input
-                        .events
-                        .push(egui::Event::Text(ch.to_string()));
-                }
-                _ => (),
-            },
-            _ => (),
-        }
-    }
-
-    fn winit_to_egui_key_code(key: VirtualKeyCode) -> Option<egui::Key> {
-        Some(match key {
-            VirtualKeyCode::Down => Key::ArrowDown,
-            VirtualKeyCode::Left => Key::ArrowLeft,
-            VirtualKeyCode::Right => Key::ArrowRight,
-            VirtualKeyCode::Up => Key::ArrowUp,
-            VirtualKeyCode::Escape => Key::Escape,
-            VirtualKeyCode::Tab => Key::Tab,
-            VirtualKeyCode::Back => Key::Backspace,
-            VirtualKeyCode::Return => Key::Enter,
-            VirtualKeyCode::Space => Key::Space,
-            VirtualKeyCode::Insert => Key::Insert,
-            VirtualKeyCode::Delete => Key::Delete,
-            VirtualKeyCode::Home => Key::Home,
-            VirtualKeyCode::End => Key::End,
-            VirtualKeyCode::PageUp => Key::PageUp,
-            VirtualKeyCode::PageDown => Key::PageDown,
-            VirtualKeyCode::Key0 => Key::Num0,
-            VirtualKeyCode::Key1 => Key::Num1,
-            VirtualKeyCode::Key2 => Key::Num2,
-            VirtualKeyCode::Key3 => Key::Num3,
-            VirtualKeyCode::Key4 => Key::Num4,
-            VirtualKeyCode::Key5 => Key::Num5,
-            VirtualKeyCode::Key6 => Key::Num6,
-            VirtualKeyCode::Key7 => Key::Num7,
-            VirtualKeyCode::Key8 => Key::Num8,
-            VirtualKeyCode::Key9 => Key::Num9,
-            VirtualKeyCode::A => Key::A,
-            VirtualKeyCode::B => Key::B,
-            VirtualKeyCode::C => Key::C,
-            VirtualKeyCode::D => Key::D,
-            VirtualKeyCode::E => Key::E,
-            VirtualKeyCode::F => Key::F,
-            VirtualKeyCode::G => Key::G,
-            VirtualKeyCode::H => Key::H,
-            VirtualKeyCode::I => Key::I,
-            VirtualKeyCode::J => Key::J,
-            VirtualKeyCode::K => Key::K,
-            VirtualKeyCode::L => Key::L,
-            VirtualKeyCode::M => Key::M,
-            VirtualKeyCode::N => Key::N,
-            VirtualKeyCode::O => Key::O,
-            VirtualKeyCode::P => Key::P,
-            VirtualKeyCode::Q => Key::Q,
-            VirtualKeyCode::R => Key::R,
-            VirtualKeyCode::S => Key::S,
-            VirtualKeyCode::T => Key::T,
-            VirtualKeyCode::U => Key::U,
-            VirtualKeyCode::V => Key::V,
-            VirtualKeyCode::W => Key::W,
-            VirtualKeyCode::X => Key::X,
-            VirtualKeyCode::Y => Key::Y,
-            VirtualKeyCode::Z => Key::Z,
-            _ => return None,
-        })
-    }
-
-    fn winit_to_egui_modifiers(modifiers: ModifiersState) -> egui::Modifiers {
-        egui::Modifiers {
-            alt: modifiers.alt(),
-            ctrl: modifiers.ctrl(),
-            shift: modifiers.shift(),
-            #[cfg(target_os = "macos")]
-            mac_cmd: modifiers.logo(),
-            #[cfg(target_os = "macos")]
-            command: modifiers.logo(),
-            #[cfg(not(target_os = "macos"))]
-            mac_cmd: false,
-            #[cfg(not(target_os = "macos"))]
-            command: modifiers.ctrl(),
-        }
-    }
-
-    fn winit_to_egui_mouse_button(
-        button: winit::event::MouseButton,
-    ) -> Option<egui::PointerButton> {
-        Some(match button {
-            winit::event::MouseButton::Left => egui::PointerButton::Primary,
-            winit::event::MouseButton::Right => egui::PointerButton::Secondary,
-            winit::event::MouseButton::Middle => egui::PointerButton::Middle,
-            _ => return None,
-        })
-    }
-
-    /// Convert from [`egui::CursorIcon`] to [`winit::window::CursorIcon`].
-    fn egui_to_winit_cursor_icon(
-        cursor_icon: egui::CursorIcon,
-    ) -> Option<winit::window::CursorIcon> {
-        Some(match cursor_icon {
-            egui::CursorIcon::Default => winit::window::CursorIcon::Default,
-            egui::CursorIcon::PointingHand => winit::window::CursorIcon::Hand,
-            egui::CursorIcon::ResizeHorizontal => winit::window::CursorIcon::ColResize,
-            egui::CursorIcon::ResizeNeSw => winit::window::CursorIcon::NeResize,
-            egui::CursorIcon::ResizeNwSe => winit::window::CursorIcon::NwResize,
-            egui::CursorIcon::ResizeVertical => winit::window::CursorIcon::RowResize,
-            egui::CursorIcon::Text => winit::window::CursorIcon::Text,
-            egui::CursorIcon::Grab => winit::window::CursorIcon::Grab,
-            egui::CursorIcon::Grabbing => winit::window::CursorIcon::Grabbing,
-            egui::CursorIcon::None => return None,
-            egui::CursorIcon::ContextMenu => winit::window::CursorIcon::ContextMenu,
-            egui::CursorIcon::Help => winit::window::CursorIcon::Help,
-            egui::CursorIcon::Progress => winit::window::CursorIcon::Progress,
-            egui::CursorIcon::Wait => winit::window::CursorIcon::Wait,
-            egui::CursorIcon::Cell => winit::window::CursorIcon::Cell,
-            egui::CursorIcon::Crosshair => winit::window::CursorIcon::Crosshair,
-            egui::CursorIcon::VerticalText => winit::window::CursorIcon::VerticalText,
-            egui::CursorIcon::Alias => winit::window::CursorIcon::Alias,
-            egui::CursorIcon::Copy => winit::window::CursorIcon::Copy,
-            egui::CursorIcon::Move => winit::window::CursorIcon::Move,
-            egui::CursorIcon::NoDrop => winit::window::CursorIcon::NoDrop,
-            egui::CursorIcon::NotAllowed => winit::window::CursorIcon::NotAllowed,
-            egui::CursorIcon::AllScroll => winit::window::CursorIcon::AllScroll,
-            egui::CursorIcon::ZoomIn => winit::window::CursorIcon::ZoomIn,
-            egui::CursorIcon::ZoomOut => winit::window::CursorIcon::ZoomOut,
-        })
+    pub fn handle_event(&mut self, winit_event: &egui_winit::winit::event::WindowEvent<'_>) -> EventResponse {
+        self.egui_winit.on_event(&self.context, winit_event)
     }
 
     /// begin frame.
-    pub fn begin_frame(&mut self) {
-        self.context.begin_frame(self.raw_input.take());
+    pub fn begin_frame(&mut self, window: &Window) {
+        let raw_input = self.egui_winit.take_egui_input(window);
+        self.context.begin_frame(raw_input);
     }
 
     /// end frame.
-    pub fn end_frame(&mut self, window: &Window) -> (egui::Output, Vec<ClippedShape>) {
-        let (output, clipped_shapes) = self.context.end_frame();
+    pub fn end_frame(&mut self, window: &Window) -> egui::FullOutput {
+        let output = self.context.end_frame();
 
-        // handle links
-        if let Some(egui::output::OpenUrl { url, .. }) = &output.open_url {
-            if let Err(err) = webbrowser::open(url) {
-                eprintln!("Failed to open url: {}", err);
-            }
-        }
+        self.egui_winit.handle_platform_output(window, &self.context, output.platform_output.clone());
 
-        // handle clipboard
-        if !output.copied_text.is_empty() {
-            if let Err(err) = self.clipboard.set_contents(output.copied_text.clone()) {
-                eprintln!("Copy/Cut error: {}", err);
-            }
-        }
-
-        // handle cursor icon
-        if self.current_cursor_icon != output.cursor_icon {
-            if let Some(cursor_icon) =
-                Integration::<A>::egui_to_winit_cursor_icon(output.cursor_icon)
-            {
-                window.set_cursor_visible(true);
-                window.set_cursor_icon(cursor_icon);
-            } else {
-                window.set_cursor_visible(false);
-            }
-            self.current_cursor_icon = output.cursor_icon;
-        }
-
-        (output, clipped_shapes)
+        
+        
+        output
     }
 
-    /// Get [`egui::CtxRef`].
-    pub fn context(&self) -> CtxRef {
+    /// Get [`egui::Context`].
+    pub fn context(&self) -> Context {
         self.context.clone()
     }
 
@@ -841,19 +545,14 @@ impl<A: AllocatorTrait> Integration<A> {
         &mut self,
         command_buffer: vk::CommandBuffer,
         swapchain_image_index: usize,
-        clipped_meshes: Vec<egui::ClippedMesh>,
+        clipped_meshes: Vec<egui::ClippedPrimitive>,
+        textures_delta: TexturesDelta
     ) {
         let index = swapchain_image_index;
 
-        // update time
-        if let Some(time) = self.start_time {
-            self.raw_input.time = Some(time.elapsed().as_secs_f64());
-        } else {
-            self.start_time = Some(Instant::now());
+        for (id, image_delta) in textures_delta.set {
+            self.update_texture(id, image_delta);
         }
-
-        // update font texture
-        self.upload_font_texture(command_buffer, &self.context.fonts().font_image());
 
         let mut vertex_buffer_ptr = self.vertex_buffer_allocations[index]
             .mapped_ptr()
@@ -962,8 +661,15 @@ impl<A: AllocatorTrait> Integration<A> {
         // render meshes
         let mut vertex_base = 0;
         let mut index_base = 0;
-        for egui::ClippedMesh(rect, mesh) in clipped_meshes {
-            // update texture
+        for egui::ClippedPrimitive { clip_rect, primitive } in clipped_meshes {
+            let mesh = match primitive {
+                egui::epaint::Primitive::Mesh(mesh) => mesh,
+                egui::epaint::Primitive::Callback(_) => todo!(),
+            };
+            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                continue;
+            }
+                      
             unsafe {
                 if let egui::TextureId::User(id) = mesh.texture_id {
                     if let Some(descriptor_set) = self.user_textures[id as usize] {
@@ -988,16 +694,11 @@ impl<A: AllocatorTrait> Integration<A> {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.pipeline_layout,
                         0,
-                        &[self.font_descriptor_sets[index]],
+                        &[*self.texture_desc_sets.get(&mesh.texture_id).unwrap()],
                         &[],
                     );
                 }
             }
-
-            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
-                continue;
-            }
-
             let v_slice = &mesh.vertices;
             let v_size = std::mem::size_of_val(&v_slice[0]);
             let v_copy_size = v_slice.len() * v_size;
@@ -1024,7 +725,7 @@ impl<A: AllocatorTrait> Integration<A> {
 
             // record draw commands
             unsafe {
-                let min = rect.min;
+                let min = clip_rect.min;
                 let min = egui::Pos2 {
                     x: min.x * self.scale_factor as f32,
                     y: min.y * self.scale_factor as f32,
@@ -1033,7 +734,7 @@ impl<A: AllocatorTrait> Integration<A> {
                     x: f32::clamp(min.x, 0.0, self.physical_width as f32),
                     y: f32::clamp(min.y, 0.0, self.physical_height as f32),
                 };
-                let max = rect.max;
+                let max = clip_rect.max;
                 let max = egui::Pos2 {
                     x: max.x * self.scale_factor as f32,
                     y: max.y * self.scale_factor as f32,
@@ -1078,261 +779,342 @@ impl<A: AllocatorTrait> Integration<A> {
         unsafe {
             self.device.cmd_end_render_pass(command_buffer);
         }
+
+        for &id in &textures_delta.free {
+            self.texture_desc_sets.remove_entry(&id); // dsc_set is destroyed with dsc_pool
+            self.texture_image_infos.remove_entry(&id);
+            if let Some((_, image)) = self.texture_images.remove_entry(&id) {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                }
+            }
+            if let Some((_, image_view)) = self.texture_image_views.remove_entry(&id) {
+                unsafe {
+                    self.device.destroy_image_view(image_view, None);
+                }
+            }
+            if let Some((_, allocation)) = self.texture_allocations.remove_entry(&id) {
+                self.allocator.free(allocation).unwrap();
+            }
+        }
     }
 
-    fn upload_font_texture(&mut self, command_buffer: vk::CommandBuffer, texture: &egui::FontImage) {
-        debug_assert_eq!(texture.pixels.len(), texture.width * texture.height);
-
-        // check version
-        if texture.version == self.font_image_version {
-            return;
-        }
-
-        unsafe {
-            self.device
-                .device_wait_idle()
-                .expect("Failed to wait device idle");
-        }
-
-        let dimensions = (texture.width as u64, texture.height as u64);
-        let data = texture
-            .pixels
-            .iter()
-            .flat_map(|&r| vec![r, r, r, r])
-            .collect::<Vec<_>>();
-
-        // free prev staging buffer
-        if let Some(allocation) = self.font_image_staging_buffer_allocation.take() {
-            self.allocator
-                .free(allocation)
-                .expect("Failed to free allocation");
-        }
-        unsafe {
-            self.device
-                .destroy_buffer(self.font_image_staging_buffer, None);
-        }
-
-        // free font image
-        unsafe {
-            self.device.destroy_image_view(self.font_image_view, None);
-        }
-        if let Some(allocation) = self.font_image_allocation.take() {
-            self.allocator
-                .free(allocation)
-                .expect("Failed to free allocation");
-        }
-        unsafe {
-            self.device.destroy_image(self.font_image, None);
-        }
-
-        // create font image
-        let font_image_staging_buffer = unsafe {
-            self.device
-                .create_buffer(
-                    &vk::BufferCreateInfo::builder()
-                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .size(dimensions.0 * dimensions.1 * 4),
-                    None,
-                )
-                .expect("Failed to create buffer.")
-        };
-        let font_image_staging_buffer_requirements = unsafe {
-            self.device
-                .get_buffer_memory_requirements(font_image_staging_buffer)
-        };
-        let font_image_staging_buffer_allocation = self
-            .allocator
-            .allocate(A::AllocationCreateInfo::new(
-                font_image_staging_buffer_requirements,
-                MemoryLocation::CpuToGpu,
-                true,
-            ))
-            .expect("Failed to create buffer.");
-        unsafe {
-            self.device
-                .bind_buffer_memory(
-                    font_image_staging_buffer,
-                    font_image_staging_buffer_allocation.memory(),
-                    font_image_staging_buffer_allocation.offset(),
-                )
-                .expect("Failed to create buffer.")
-        }
-        self.font_image_staging_buffer = font_image_staging_buffer;
-        self.font_image_staging_buffer_allocation = Some(font_image_staging_buffer_allocation);
-        let font_image = unsafe {
-            self.device
-                .create_image(
-                    &vk::ImageCreateInfo::builder()
-                        .format(vk::Format::R8G8B8A8_UNORM)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .extent(vk::Extent3D {
-                            width: dimensions.0 as u32,
-                            height: dimensions.1 as u32,
-                            depth: 1,
-                        }),
-                    None,
-                )
-                .expect("Failed to create image.")
-        };
-        let font_image_requirements =
-            unsafe { self.device.get_image_memory_requirements(font_image) };
-        let font_image_allocation = self
-            .allocator
-            .allocate(A::AllocationCreateInfo::new(
-                font_image_requirements,
-                MemoryLocation::GpuOnly,
-                false,
-            ))
-            .expect("Failed to create image.");
-        unsafe {
-            self.device
-                .bind_image_memory(
-                    font_image,
-                    font_image_allocation.memory(),
-                    font_image_allocation.offset(),
-                )
-                .expect("Failed to create image.")
-        }
-        self.font_image = font_image;
-        self.font_image_allocation = Some(font_image_allocation);
-        self.font_image_view = unsafe {
-            self.device.create_image_view(
-                &vk::ImageViewCreateInfo::builder()
-                    .image(self.font_image)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_array_layer(0)
-                            .base_mip_level(0)
-                            .layer_count(1)
-                            .level_count(1)
-                            .build(),
-                    ),
-                None,
-            )
-        }
-        .expect("Failed to create image view.");
-        self.font_image_size = dimensions;
-        self.font_image_version = texture.version;
-
-        // update descriptor set
-        for &font_descriptor_set in self.font_descriptor_sets.iter() {
-            unsafe {
-                self.device.update_descriptor_sets(
-                    &[vk::WriteDescriptorSet::builder()
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .dst_set(font_descriptor_set)
-                        .image_info(&[vk::DescriptorImageInfo::builder()
-                            .image_view(self.font_image_view)
-                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .sampler(self.sampler)
-                            .build()])
-                        .dst_binding(0)
-                        .build()],
-                    &[],
+    fn update_texture(&mut self, texture_id: TextureId, delta: ImageDelta) {
+        // Extract pixel data from egui
+        let data: Vec<u8> = match &delta.image {
+            egui::ImageData::Color(image) => {
+                assert_eq!(
+                    image.width() * image.height(),
+                    image.pixels.len(),
+                    "Mismatch between texture size and texel count"
                 );
+                image.pixels.iter().flat_map(|color| color.to_array()).collect()
             }
-        }
-
-        // map memory
-        if let Some(allocation) = &self.font_image_staging_buffer_allocation {
-            let ptr = allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+            egui::ImageData::Font(image) => {
+                image.srgba_pixels(None).flat_map(|color| color.to_array()).collect()
+            }
+        };
+        let cmd_pool = {
+            let cmd_pool_info = vk::CommandPoolCreateInfo::builder()
+                .queue_family_index(self.qfi)
+                .build();
             unsafe {
-                ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+                self.device.create_command_pool(&cmd_pool_info, None).unwrap()
             }
+        };
+        let cmd_buff = {
+            let cmd_buff_alloc_info = vk::CommandBufferAllocateInfo::builder()
+                .command_buffer_count(1u32)
+                .command_pool(cmd_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .build();
+            unsafe {
+                self.device.allocate_command_buffers(&cmd_buff_alloc_info).unwrap()[0]
+            }
+        };
+        let fence_info = vk::FenceCreateInfo::builder()
+            .build();
+        let cmd_buff_fence = unsafe { self.device.create_fence(&fence_info, None).unwrap() };
+        
+        let (staging_buffer, staging_allocation) = {
+            let buffer_size = data.len() as vk::DeviceSize;
+            let buffer_info = vk::BufferCreateInfo::builder()
+                .size(buffer_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC);
+            let texture_buffer = unsafe { self.device.create_buffer(&buffer_info, None) }.unwrap();
+            let requirements = unsafe { self.device.get_buffer_memory_requirements(texture_buffer) };
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
+                requirements,
+                MemoryLocation::CpuToGpu,
+                true
+            )).unwrap();
+            unsafe { self.device.bind_buffer_memory(texture_buffer, allocation.memory(), allocation.offset()).unwrap() };
+            (texture_buffer, allocation)
+        };
+        let ptr = staging_allocation.mapped_ptr().unwrap().as_ptr() as *mut u8;
+        unsafe {
+            ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        }
+        let (texture_image, info, texture_allocation) = {
+            let extent = vk::Extent3D {
+                width: delta.image.width() as u32,
+                height: delta.image.height() as u32,
+                depth:1
+            };
+            let create_info = vk::ImageCreateInfo::builder()
+                .array_layers(1)
+                .extent(extent)
+                .flags(vk::ImageCreateFlags::empty())
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .image_type(vk::ImageType::TYPE_2D)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .mip_levels(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC)
+                .build();
+            let handle = unsafe { self.device.create_image(&create_info, None) }.unwrap();
+            let requirements = unsafe { self.device.get_image_memory_requirements(handle) };
+            let allocation = self.allocator.allocate(A::AllocationCreateInfo::new(
+                requirements,
+                MemoryLocation::GpuOnly,
+                false
+            )).unwrap();
+            unsafe { self.device.bind_image_memory(handle, allocation.memory(), allocation.offset()).unwrap() };
+            (handle, create_info, allocation)
+        };
+        self.texture_image_infos.insert(texture_id, info);
+        let texture_image_view = {
+            let create_info = vk::ImageViewCreateInfo::builder()
+                .components(vk::ComponentMapping::default())
+                .flags(vk::ImageViewCreateFlags::empty())
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .image(texture_image)
+                .subresource_range(vk::ImageSubresourceRange::builder()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_array_layer(0)
+                    .base_mip_level(0)
+                    .layer_count(1)
+                    .level_count(1)
+                    .build())
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .build();
+            unsafe { self.device.create_image_view(&create_info, None).unwrap() }
+        };
+        // begin cmd buff
+        unsafe {
+            let cmd_buff_begin_info = vk::CommandBufferBeginInfo::builder()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                .build();
+            self.device.begin_command_buffer(cmd_buff, &cmd_buff_begin_info).unwrap();
+        }
+        // Transition texture image for transfer dst
+        insert_image_memory_barrier(&self.device, &cmd_buff,
+            &texture_image,
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::AccessFlags::NONE_KHR,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::PipelineStageFlags::HOST,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0u32)
+                .layer_count(1u32)
+                .base_mip_level(0u32)
+                .level_count(1u32)
+                .build());
+        let region = vk::BufferImageCopy::builder()
+            .buffer_offset(0)
+            .buffer_row_length(delta.image.width() as u32)
+            .buffer_image_height(delta.image.height() as u32)
+            .image_subresource(vk::ImageSubresourceLayers::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0)
+                .build())
+            .image_offset(vk::Offset3D { x: 0, y: 0, z: 0})
+            .image_extent(vk::Extent3D { width: delta.image.width() as u32, height: delta.image.height() as u32, depth: 1})
+            .build();
+        unsafe { self.device.cmd_copy_buffer_to_image(cmd_buff, staging_buffer, texture_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]); }
+        insert_image_memory_barrier(&self.device, &cmd_buff,
+            &texture_image,
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::QUEUE_FAMILY_IGNORED,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::VERTEX_SHADER,
+            vk::ImageSubresourceRange::builder()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0u32)
+                .layer_count(1u32)
+                .base_mip_level(0u32)
+                .level_count(1u32)
+                .build());
+        
+        unsafe {
+            self.device.end_command_buffer(cmd_buff).unwrap();
+        }
+        let cmd_buffs = [cmd_buff];
+        let submit_infos = [
+            vk::SubmitInfo::builder()
+            .command_buffers(&cmd_buffs)
+            .build()
+        ];
+        unsafe {
+            self.device.queue_submit(self.queue, &submit_infos, cmd_buff_fence).unwrap();
+            self.device.wait_for_fences(&[cmd_buff_fence], true, u64::MAX).unwrap();
         }
 
-        // record buffer staging commands to command buffer
+        // texture is now in GPU memory, now we need to decide whether we should register it as new or update existing
+
+        if let Some(pos) = delta.pos { // Blit texture data to existing texture if delta pos exists (e.g. font changed)
+            let existing_texture = self.texture_images.get(&texture_id);
+            if let Some(existing_texture) = existing_texture {
+                let info = self.texture_image_infos.get(&texture_id).unwrap();
+                unsafe {
+                    self.device.reset_command_pool(cmd_pool, vk::CommandPoolResetFlags::empty()).unwrap();
+                    self.device.reset_fences(&[cmd_buff_fence]).unwrap();
+                    // begin cmd buff
+                    let cmd_buff_begin_info = vk::CommandBufferBeginInfo::builder()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)
+                        .build();
+                    self.device.begin_command_buffer(cmd_buff, &cmd_buff_begin_info).unwrap();
+                    
+                    // Transition existing image for transfer dst
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                        &existing_texture,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_array_layer(0u32)
+                            .layer_count(1u32)
+                            .base_mip_level(0u32)
+                            .level_count(1u32)
+                            .build());
+                    // Transition new image for transfer src
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                        &texture_image,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_array_layer(0u32)
+                            .layer_count(1u32)
+                            .base_mip_level(0u32)
+                            .level_count(1u32)
+                            .build());
+                    let top_left = vk::Offset3D { x: pos[0] as i32, y: pos[1] as i32, z: 0 };
+                    let bottom_right = vk::Offset3D { x: pos[0] as i32 + delta.image.width() as i32, y: pos[1] as i32 + delta.image.height() as i32, z: 1 };
+
+                    let region = vk::ImageBlit {
+                        src_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        src_offsets: [vk::Offset3D{ x: 0, y: 0, z: 0 }, vk::Offset3D{ x: info.extent.width as i32, y: info.extent.height as i32, z: info.extent.depth as i32 }],
+                        dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        dst_offsets: [top_left, bottom_right]
+                    };
+                    self.device.cmd_blit_image(cmd_buff, texture_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, *existing_texture, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region], vk::Filter::NEAREST);
+
+                    // Transition existing image for shader read
+                    insert_image_memory_barrier(&self.device, &cmd_buff,
+                        &existing_texture,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::QUEUE_FAMILY_IGNORED,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::ImageSubresourceRange::builder()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_array_layer(0u32)
+                            .layer_count(1u32)
+                            .base_mip_level(0u32)
+                            .level_count(1u32)
+                            .build());
+                    self.device.end_command_buffer(cmd_buff).unwrap();
+                    let cmd_buffs = [cmd_buff];
+                    let submit_infos = [
+                        vk::SubmitInfo::builder()
+                        .command_buffers(&cmd_buffs)
+                        .build()
+                    ];
+                    self.device.queue_submit(self.queue, &submit_infos, cmd_buff_fence).unwrap();
+                    self.device.wait_for_fences(&[cmd_buff_fence], true, u64::MAX).unwrap();
+
+                    // destroy texture_image and view
+                    self.device.destroy_image(texture_image, None);
+                    self.device.destroy_image_view(texture_image_view, None);
+                    self.allocator.free(texture_allocation).unwrap();
+                }
+            } else {
+                return;
+            }
+        } else { // Otherwise save the newly created texture
+
+            // update dsc set
+            let dsc_set = {
+                let dsc_alloc_info = vk::DescriptorSetAllocateInfo::builder()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&[self.descriptor_set_layouts[0]])
+                    .build();
+                unsafe {
+                    self.device.allocate_descriptor_sets(&dsc_alloc_info).unwrap()[0]
+                }
+            };
+            let image_info = vk::DescriptorImageInfo::builder()
+                    .image_view(texture_image_view)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .sampler(self.sampler)
+                    .build();
+            let dsc_writes = [
+                    vk::WriteDescriptorSet::builder()
+                        .dst_set(dsc_set)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .dst_array_element(0_u32)
+                        .dst_binding(0_u32)
+                        .image_info(&[image_info])
+                        .build()
+                ];
+            unsafe {
+                self.device.update_descriptor_sets(&dsc_writes, &[]);
+            }
+            // register new texture
+            self.texture_images.insert(texture_id, texture_image);
+            self.texture_allocations.insert(texture_id, texture_allocation);
+            self.texture_image_views.insert(texture_id, texture_image_view);
+            self.texture_desc_sets.insert(texture_id, dsc_set);
+        }
+        // cleanup
         unsafe {
-            // update image layout to transfer dst optimal
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::HOST,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::builder()
-                    .image(self.font_image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1)
-                            .base_mip_level(0)
-                            .base_array_layer(0)
-                            .build(),
-                    )
-                    .src_access_mask(vk::AccessFlags::default())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .build()],
-            );
-
-            // copy staging buffer to image
-            self.device.cmd_copy_buffer_to_image(
-                command_buffer,
-                self.font_image_staging_buffer,
-                self.font_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy::builder()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_array_layer(0)
-                            .layer_count(1)
-                            .mip_level(0)
-                            .build(),
-                    )
-                    .image_extent(
-                        vk::Extent3D::builder()
-                            .width(dimensions.0 as u32)
-                            .height(dimensions.1 as u32)
-                            .depth(1)
-                            .build(),
-                    )
-                    .build()],
-            );
-
-            // update image layout to shader read only optimal
-            self.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ALL_GRAPHICS,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::builder()
-                    .image(self.font_image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::builder()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1)
-                            .base_mip_level(0)
-                            .base_array_layer(0)
-                            .build(),
-                    )
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .build()],
-            );
+            self.device.destroy_buffer(staging_buffer, None);
+            self.allocator.free(staging_allocation).unwrap();
+            self.device.destroy_command_pool(cmd_pool, None);
+            self.device.destroy_fence(cmd_buff_fence, None);
         }
     }
-
+    
     /// Update swapchain.
     pub fn update_swapchain(
         &mut self,
@@ -1682,20 +1464,7 @@ impl<A: AllocatorTrait> Integration<A> {
     pub unsafe fn destroy(&mut self) {
         self.device
             .destroy_descriptor_set_layout(self.user_texture_layout, None);
-        self.device.destroy_image_view(self.font_image_view, None);
-        self.device.destroy_image(self.font_image, None);
-        if let Some(allocation) = self.font_image_allocation.take() {
-            self.allocator
-                .free(allocation)
-                .expect("Failed to free allocation");
-        }
-        self.device
-            .destroy_buffer(self.font_image_staging_buffer, None);
-        if let Some(allocation) = self.font_image_staging_buffer_allocation.take() {
-            self.allocator
-                .free(allocation)
-                .expect("Failed to free allocation");
-        }
+        
         for (buffer, allocation) in self
             .index_buffers
             .drain(0..)
@@ -1733,5 +1502,15 @@ impl<A: AllocatorTrait> Integration<A> {
         }
         self.device
             .destroy_descriptor_pool(self.descriptor_pool, None);
+
+        for (_texture_id, texture_image) in self.texture_images.drain() {
+            self.device.destroy_image(texture_image, None);
+        }
+        for (_texture_id, texture_image_view) in self.texture_image_views.drain() {
+            self.device.destroy_image_view(texture_image_view, None);
+        }
+        for (_texture_id, texture_allocation) in self.texture_allocations.drain() {
+            self.allocator.free(texture_allocation).unwrap();
+        }
     }
 }
