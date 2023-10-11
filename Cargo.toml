@@ -25,7 +25,6 @@ gpu-allocator-feature = [ "gpu-allocator" ]
 anyhow = "1.0.53"
 ash = { version="0.37.1", default-features = false }
 bytemuck = "1.7.3"
-copypasta = "0.8.1"
 egui = "0.23.0"
 egui-winit = "0.23.0"
 gpu-allocator = { version = "0.23.0", default-features = false, features = ["vulkan"], optional = true }
@@ -41,6 +40,7 @@ memoffset = "0.9.0"
 mint = "0.5.9"
 tobj = "4.0.0"
 ash = { version="0.37.1", default-features = false, features = ["linked", "debug"] }
+copypasta = "0.8.1"
 
 [dev-dependencies.cgmath]
 version = "0.18.0"
