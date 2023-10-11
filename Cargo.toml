@@ -18,15 +18,28 @@ include = [
 ]
 
 [features]
-default = [ "gpu-allocator-feature" ]
+default = [ "gpu-allocator-feature", "egui-winit/default" ]
 gpu-allocator-feature = [ "gpu-allocator" ]
+
+## Underlying egui-winit features
+accesskit = ["egui-winit/accesskit"]
+android-game-activity = ["egui-winit/android-game-activity"]
+android-native-activity = ["egui-winit/android-native-activity"]
+bytemuck = ["egui-winit/bytemuck"]
+clipboard = ["egui-winit/clipboard"]
+links = ["egui-winit/links"]
+puffin = ["egui-winit/puffin"]
+serde = ["egui-winit/serde"]
+wayland = ["egui-winit/wayland"]
+x11 = ["egui-winit/x11"]
+
 
 [dependencies]
 anyhow = "1.0.53"
 ash = { version="0.37.1", default-features = false }
 bytemuck = "1.7.3"
 egui = "0.23.0"
-egui-winit = "0.23.0"
+egui-winit = { version = "0.23.0", default-features = false }
 gpu-allocator = { version = "0.23.0", default-features = false, features = ["vulkan"], optional = true }
 raw-window-handle = { version="0.5.0" }
 

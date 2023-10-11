@@ -29,7 +29,7 @@ fn main() -> Result<()> {
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
-        
+
         match event {
             Event::WindowEvent { event, window_id: _ } => {
                 // (2) Call integration.handle_event(&event).
@@ -63,6 +63,12 @@ fn main() -> Result<()> {
 ```
 
 [Full example is in examples directory](https://github.com/MatchaChoco010/egui-winit-ash-integration/tree/main/examples)
+
+# Feature flags
+
+`gpu-allocator-feature` - Enables the gpu-allocator crate.
+
+The other features directly control the underlying [egui_winit features](https://docs.rs/egui-winit/latest/egui_winit/)
 
 # License
 
