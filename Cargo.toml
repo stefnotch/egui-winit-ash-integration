@@ -28,7 +28,7 @@ bytemuck = "1.7.3"
 copypasta = "0.8.1"
 egui = "0.23.0"
 egui-winit = "0.23.0"
-gpu-allocator = { version = "0.21.0", default-features = false, features = ["vulkan"], optional = true }
+gpu-allocator = { version = "0.23.0", default-features = false, features = ["vulkan"], optional = true }
 webbrowser = "0.8.4"
 winit = "0.28.7"
 raw-window-handle = { version="0.5.0" }
