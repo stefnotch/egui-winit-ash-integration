@@ -28,7 +28,6 @@ bytemuck = "1.7.3"
 egui = "0.23.0"
 egui-winit = "0.23.0"
 gpu-allocator = { version = "0.23.0", default-features = false, features = ["vulkan"], optional = true }
-webbrowser = "0.8.4"
 winit = "0.28.7"
 raw-window-handle = { version="0.5.0" }
 
@@ -40,7 +39,6 @@ memoffset = "0.9.0"
 mint = "0.5.9"
 tobj = "4.0.0"
 ash = { version="0.37.1", default-features = false, features = ["linked", "debug"] }
-copypasta = "0.8.1"
 
 [dev-dependencies.cgmath]
 version = "0.18.0"
